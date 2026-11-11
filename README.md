@@ -1,6 +1,4 @@
-# AI Audio Picture Book Studio
-
-EduPlay AI Innovation Ltd · Koo Ho Yin
+# LiveStoryBook: AI Audio animated ebook from scanned book
 
 Turn a scanned kindergarten picture book into a live **animated audio e-book**:
 clean the printed text off each page, generate a short looping animation with

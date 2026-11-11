@@ -4,7 +4,10 @@ Turn a scanned kindergarten picture book into a live **animated audio e-book**:
 clean the printed text off each page, generate a short looping animation with
 **Wan** image-to-video, narrate with **Qwen TTS**, and re-type the words in place
 in the reader, synced to the voice.
-
+## Input:
+![alt text](<Three Little Pigs (Read It Yourself Level 2) (Ladybird)_13.png>)
+## Output:
+![alt text](sample.gif)
 ## Repository layout
 
 | Folder | What it is |

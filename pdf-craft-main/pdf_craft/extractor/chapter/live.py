@@ -1,0 +1,298 @@
+"""Bridge persisted OCR completions to ordered, incremental chapter analysis."""
+
+import asyncio
+from contextlib import aclosing
+from pathlib import Path
+
+from ...concurrency import settle_tasks
+from ...common import XMLReader, read_xml
+from ...common.stream import DiskDelivery, DiskStream
+from ...pdf import Page, decode
+from ...pdf.ocr import OCREventKind
+from ...runtime import IO_DOMAIN
+from .traditional import TraditionalAssembly
+from ..refinement import MAX_INPUT_LEAD
+
+
+class LiveExtraction:
+    """Only page-order metadata stays in RAM; all content queues live on disk."""
+
+    def __init__(self, path: Path, pages_path: Path, includes_footnotes: bool,
+                 on_body=None, on_footnote=None, *, refinement=None, page_indexes=None) -> None:
+        self.pages_path = pages_path
+        self.includes_footnotes = includes_footnotes
+        if not includes_footnotes:
+            on_footnote = None
+        self.database = path / "content.sqlite"
+        self.pages: DiskStream[Page] = DiskStream(path / "pages")
+        self.order: list[int] = []
+        self.ready: set[int] = set()
+        self.ignored: set[int] = set()
+        self.position = 0
+        self.analysis_error: Exception | None = None
+        self.deliveries = []
+        self._lock = asyncio.Lock()
+        self._stopped = False
+        self._finishing: asyncio.Task | None = None
+        self._failure: BaseException | None = None
+        self._refining = refinement is not None
+        self._consumed = 0
+        self._admitted = 0
+        self._page_indexes = page_indexes
+        self._expected_order = None
+        self._capacity = asyncio.Event()
+
+        def callback(kind, handler):
+            if handler is None:
+                return None
+            async def notify(value):
+                from ...runtime import invoke_callback
+                try:
+                    await invoke_callback(handler, value)
+                except Exception as error:
+                    setattr(error, '_pdf_craft_callback', True)
+                    raise
+            delivery = DiskDelivery(path / kind, notify)
+            self.deliveries.append(delivery)
+            return delivery.write
+
+        body = callback("body", on_body)
+        footnote = callback("footnote", on_footnote)
+        self.task = asyncio.create_task(
+            self._refine(refinement, body, footnote) if refinement is not None
+            else self._traditional(body, footnote))
+
+        self.task.add_done_callback(lambda _task: self._capacity.set())
+
+    def _decode(self, element):
+        from .primary import project_page
+        return project_page(decode(element), self.includes_footnotes or self._refining)
+
+    async def _refine(self, factory, on_body, on_footnote):
+        from .assembly import PageAssembly
+        from ..refinement import refine_ready
+        assembly = await IO_DOMAIN.run(lambda: PageAssembly(
+            self.database, on_body=on_body, on_footnote=on_footnote))
+        async with factory() as process, aclosing(refine_ready(
+                self.pages.aread(), process, self.pages.path / 'refinement',
+                self._refinement_order, includes_footnotes=self.includes_footnotes)) as results:
+            async for result in results:
+                try:
+                    await IO_DOMAIN.run(assembly.validate, result.page)
+                except Exception as error:
+                    if result.usage is not None:
+                        result.usage.settle(False)
+                    from ..recovery import recoverable_structure
+                    if result.initial is None or not recoverable_structure(error):
+                        raise
+                    from ..._policy import recover
+                    from ...policies import FailureCategory, FailureLocation
+                    await recover(error, FailureCategory.ANALYSIS, 'footnote_commit', 'algorithm_result',
+                                  targets=(FailureLocation('page', page_indexes=(result.page.page_index,)),))
+                    await IO_DOMAIN.run(assembly.validate, result.initial)
+                    result.page = result.initial
+                    result.initial = None
+                    result.usage = None
+                except BaseException:
+                    if result.usage is not None:
+                        result.usage.settle(False)
+                    raise
+                try:
+                    await IO_DOMAIN.run(assembly.append, result.page)
+                except BaseException:
+                    if result.usage is not None:
+                        result.usage.settle(False)
+                    raise
+                if result.usage is not None:
+                    result.usage.settle(True)
+                self._consumed += 1
+                self._capacity.set()
+        await IO_DOMAIN.run(assembly.finish)
+
+    async def _traditional(self, on_body, on_footnote):
+        assembly = await IO_DOMAIN.run(
+            TraditionalAssembly, self.database, includes_footnotes=self.includes_footnotes,
+            on_body=on_body, on_footnote=on_footnote)
+        async for page in self.pages.aread():
+            await IO_DOMAIN.run(assembly.append, page)
+        await IO_DOMAIN.run(assembly.finish)
+
+    def _refinement_order(self):
+        if self._expected_order is None:
+            return ()  # A cache/direct stream discovers its order from input.
+        if not self.ignored:
+            return self._expected_order
+        return [index for index in self._expected_order if index not in self.ignored]
+
+    async def _wait_capacity(self, ordinal):
+        while self._refining:
+            self._capacity.clear()
+            if self.task.done():
+                try:
+                    await self.task
+                except Exception as error:
+                    self._record_error(error)
+                return
+            if ordinal < self._consumed + MAX_INPUT_LEAD:
+                return
+            await self._capacity.wait()
+
+    async def event(self, event):
+        async with self._lock:
+            if self._failure is not None:
+                raise self._failure
+            if self._stopped:
+                raise RuntimeError("extraction stream is closed")
+            try:
+                await self._event(event)
+                admit = event.kind == OCREventKind.START and (
+                    self._page_indexes is None or event.page_index in self._page_indexes)
+                ordinal = self._admitted
+                if admit:
+                    self._admitted += 1
+            except BaseException as error:
+                self._failure = error
+                self.pages.close(error)
+                raise
+        # Admission waits outside the consumption lock: an older OCR request
+        # must remain able to publish the input that makes this window advance.
+        if admit:
+            await self._wait_capacity(ordinal)
+
+    async def _event(self, event):
+        if self.task.done():
+            try:
+                await self.task
+            except Exception as error:
+                self._record_error(error)
+        if self.analysis_error is not None:
+            return
+        if self._refining and self._expected_order is None:
+            indexes = range(1, event.total_pages + 1)
+            self._expected_order = indexes if self._page_indexes is None else [
+                index for index in indexes if index in self._page_indexes]
+        terminal = event.kind in (OCREventKind.COMPLETE, OCREventKind.SKIP, OCREventKind.FAILED)
+        duplicate = terminal and event.page_index in self.ready
+        if event.kind == OCREventKind.START:
+            self.order.append(event.page_index)
+        elif event.kind == OCREventKind.IGNORE:
+            self.ignored.add(event.page_index)
+        elif event.kind in (OCREventKind.COMPLETE, OCREventKind.SKIP, OCREventKind.FAILED):
+            self.ready.add(event.page_index)
+        validated_page = None
+        if terminal and not duplicate:
+            if self._page_indexes is None or event.page_index in self._page_indexes:
+                page_path = self.pages_path / f"page_{event.page_index}.xml"
+                if event.kind == OCREventKind.FAILED and not await IO_DOMAIN.run(page_path.exists):
+                    # Some OCR adapters report a terminal failure without a
+                    # fallback page. It is skipped, not a corrupt XML result.
+                    self.ignored.add(event.page_index)
+                if event.page_index not in self.ignored:
+                    try:
+                        validated_page = await IO_DOMAIN.run(self._decode, await IO_DOMAIN.run(
+                            read_xml, page_path))
+                    except Exception as error:
+                        setattr(error, 'page_index', event.page_index)
+                        self._record_error(error)
+                        return
+                    if self._refining:
+                        await IO_DOMAIN.run(self.pages.append, validated_page)
+                if not self._refining or event.page_index in self.ignored:
+                    from ..progress import page_stage
+                    await page_stage(event.page_index, 7)
+        if self._refining:
+            return
+        while self.position < len(self.order):
+            index = self.order[self.position]
+            if index in self.ignored:
+                self.ignored.remove(index)
+            elif index in self.ready:
+                try:
+                    page = validated_page if index == event.page_index and validated_page is not None else (
+                        await IO_DOMAIN.run(self._decode, await IO_DOMAIN.run(
+                            read_xml, self.pages_path / f"page_{index}.xml")))
+                except Exception as error:
+                    setattr(error, 'page_index', index)
+                    self._record_error(error)
+                    return
+                await IO_DOMAIN.run(self.pages.append, page)
+                self.ready.remove(index)
+            else:
+                break
+            self.position += 1
+
+    async def finish(self):
+        async with self._lock:
+            if self._failure is not None:
+                raise self._failure
+            if self._finishing is None:
+                if self._stopped:
+                    raise RuntimeError("extraction stream is closed")
+                self._stopped = True
+                self._finishing = asyncio.create_task(self._finish())
+            finishing = self._finishing
+        # Do not hold the event lock while waiting for user callbacks: cancel
+        # must be able to close input and interrupt those deliveries.
+        try:
+            await asyncio.shield(finishing)
+        except BaseException as error:
+            if self._failure is None:
+                self._failure = error
+            self.pages.close(error)
+            finishing.cancel()
+            raise
+
+    async def _finish(self):
+        if not self.order:
+            # A complete OCR cache emits no page events, but is replayable.
+            reader = await IO_DOMAIN.run(XMLReader, "page", self.pages_path, self._decode)
+            from ...runtime import worker_iter
+            try:
+                ordinal = 0
+                async for page in worker_iter(reader.read()):
+                    if self._page_indexes is not None and page.index not in self._page_indexes:
+                        continue
+                    await self._wait_capacity(ordinal)
+                    from ..progress import active_extraction
+                    from ...progress import UnitOutcome
+                    progress = active_extraction()
+                    if progress is not None:
+                        await progress.page(page.index, 4, UnitOutcome.REUSED)
+                        if not self._refining:
+                            await progress.page(page.index, 7)
+                    await IO_DOMAIN.run(self.pages.append, page)
+                    ordinal += 1
+            except Exception as error:
+                self._record_error(error)
+        # A missing page after a decode failure is not successful input EOF.
+        # Preserve the original page location for finite recovery instead of
+        # replacing it with a scheduler-wide missing-input error.
+        self.pages.close(self.analysis_error)
+        try:
+            await self.task
+        except Exception as error:
+            self._record_error(error)
+        for delivery in self.deliveries:
+            await delivery.finish()
+
+    def _record_error(self, error):
+        from ..recovery import recoverable_structure
+        if not recoverable_structure(error):
+            raise error
+        self.analysis_error = error
+
+    async def cancel(self):
+        async with self._lock:
+            self._stopped = True
+            self.pages.close(self._failure or RuntimeError("extraction stream aborted"))
+            # Closing input only wakes readers. A full refinement window can
+            # instead be waiting for a provider or admission slot indefinitely.
+            # Cancelling its owner enters refine_pages' child-task teardown.
+            self.task.cancel()
+            if self._finishing is not None:
+                self._finishing.cancel()
+        try:
+            for delivery in self.deliveries:
+                await delivery.cancel()
+        finally:
+            await settle_tasks([self.task] + ([self._finishing] if self._finishing is not None else []))

@@ -1,0 +1,466 @@
+from pdf_craft.common.whitespace import normalize_whitespace
+import tempfile
+from pathlib import Path
+
+from PIL.Image import Image
+
+from ..common import ASSET_TAGS, AssetHub, safe_text
+from ..error import OCRBillingError, OCRError
+from ..policies import ErrorCallbackError
+from ..metering import AbortedCheck, check_aborted
+from ..ocr_config import (
+    DeepSeekOCR2LocalConfig,
+    DeepSeekOCR2VendorConfig,
+    DeepSeekOCRLocalConfig,
+    DeepSeekOCRVendorConfig,
+    OCRConfig,
+    UnlimitedOCRLocalConfig,
+    UnlimitedOCRVendorConfig,
+)
+from .ngrams import has_repetitive_ngrams
+from .types import DeepSeekOCRSize, Page, PageLayout
+from .line_geometry import first_line_inset, has_vertical_columns, number_ink_bbox, printed_line_metrics
+from .ruled_forms import preserve_ruled_forms
+
+_LAYOUT_KIND_TO_REF = {
+    "text": "text",
+    "title": "sub_title",
+    "image": "image",
+    "image_caption": "image_caption",
+    "table": "table",
+    "table_caption": "table_caption",
+    "equation": "equation",
+    "equation_caption": "equation_caption",
+    "footnote": "text",
+    "aside": "text",
+}
+
+_LOCAL_OCR_CONFIG_TYPES = (
+    DeepSeekOCRLocalConfig,
+    DeepSeekOCR2LocalConfig,
+    UnlimitedOCRLocalConfig,
+)
+
+
+def _create_local_page_extractor(factory):
+    """Turn a missing optional local runtime into an actionable package error."""
+    try:
+        return factory()
+    except ModuleNotFoundError as error:
+        raise RuntimeError(
+            "Local OCR requires the optional local runtime. "
+            "Install it with: pip install 'pdf-craft[local]'"
+        ) from error
+
+
+class PageExtractorNode:
+    def __init__(self, ocr: OCRConfig) -> None:
+        self._ocr = ocr
+        self._page_extractor = None
+
+    def _get_page_extractor(self):
+        if not self._page_extractor:
+            self._page_extractor = self._create_page_extractor()
+        return self._page_extractor
+
+    def _create_page_extractor(self):
+        # 尽可能推迟 doc-page-extractor 的加载时间
+        if isinstance(self._ocr, DeepSeekOCRLocalConfig):
+            ocr = self._ocr
+            from doc_page_extractor.extractor import create_deepseek_ocr_page_extractor
+
+            return _create_local_page_extractor(
+                lambda: create_deepseek_ocr_page_extractor(
+                    ocr_model="deepseek-ocr",
+                    model_path=ocr.models_cache_path,
+                    local_only=ocr.local_only,
+                    enable_devices_numbers=ocr.enable_devices_numbers,
+                )
+            )
+        if isinstance(self._ocr, DeepSeekOCR2LocalConfig):
+            ocr = self._ocr
+            from doc_page_extractor.extractor import create_deepseek_ocr_page_extractor
+
+            return _create_local_page_extractor(
+                lambda: create_deepseek_ocr_page_extractor(
+                    ocr_model="deepseek-ocr2",
+                    model_path=ocr.models_cache_path,
+                    local_only=ocr.local_only,
+                    enable_devices_numbers=ocr.enable_devices_numbers,
+                )
+            )
+        if isinstance(self._ocr, UnlimitedOCRLocalConfig):
+            ocr = self._ocr
+            from doc_page_extractor.extractor import create_unlimited_ocr_page_extractor
+
+            return _create_local_page_extractor(
+                lambda: create_unlimited_ocr_page_extractor(
+                    model_path=ocr.models_cache_path,
+                    local_only=ocr.local_only,
+                    enable_devices_numbers=ocr.enable_devices_numbers,
+                )
+            )
+        if isinstance(self._ocr, DeepSeekOCRVendorConfig):
+            from doc_page_extractor.adapters.deepseek import (
+                DeepSeekOCRVendorConfig as UpstreamDeepSeekOCRVendorConfig,
+            )
+            from doc_page_extractor.extractor import (
+                create_deepseek_ocr_vendor_page_extractor,
+            )
+
+            return create_deepseek_ocr_vendor_page_extractor(
+                UpstreamDeepSeekOCRVendorConfig(
+                    base_url=self._ocr.base_url,
+                    api_key=self._ocr.api_key,
+                    model=self._ocr.model,
+                    temperature=self._ocr.temperature,
+                    top_p=self._ocr.top_p,
+                    max_tokens=self._ocr.max_tokens,
+                    timeout_seconds=self._ocr.timeout_seconds,
+                )
+            )
+        if isinstance(self._ocr, DeepSeekOCR2VendorConfig):
+            from doc_page_extractor.adapters.deepseek import (
+                DeepSeekOCR2VendorConfig as UpstreamDeepSeekOCR2VendorConfig,
+            )
+            from doc_page_extractor.extractor import (
+                create_deepseek_ocr2_vendor_page_extractor,
+            )
+
+            return create_deepseek_ocr2_vendor_page_extractor(
+                UpstreamDeepSeekOCR2VendorConfig(
+                    base_url=self._ocr.base_url,
+                    api_key=self._ocr.api_key,
+                    model=self._ocr.model,
+                    temperature=self._ocr.temperature,
+                    top_p=self._ocr.top_p,
+                    max_tokens=self._ocr.max_tokens,
+                    timeout_seconds=self._ocr.timeout_seconds,
+                )
+            )
+        if isinstance(self._ocr, UnlimitedOCRVendorConfig):
+            from doc_page_extractor.adapters.unlimited import (
+                UnlimitedOCRVendorConfig as UpstreamUnlimitedOCRVendorConfig,
+            )
+            from doc_page_extractor.extractor import (
+                create_unlimited_ocr_vendor_page_extractor,
+            )
+
+            return create_unlimited_ocr_vendor_page_extractor(
+                UpstreamUnlimitedOCRVendorConfig(
+                    ak=self._ocr.ak,
+                    sk=self._ocr.sk,
+                    base_url=self._ocr.base_url,
+                    poll_interval_seconds=self._ocr.poll_interval_seconds,
+                    timeout_seconds=self._ocr.timeout_seconds,
+                )
+            )
+        raise TypeError(f"Unsupported OCR config: {type(self._ocr).__name__}")
+
+    def download_models(self, revision: str | None) -> None:
+        if not isinstance(self._ocr, _LOCAL_OCR_CONFIG_TYPES):
+            raise RuntimeError("download_models is only available for local OCR.")
+        self._get_page_extractor().download_ocr_model(revision)
+
+    def load_models(self) -> None:
+        if not isinstance(self._ocr, _LOCAL_OCR_CONFIG_TYPES):
+            raise RuntimeError("load_models is only available for local OCR.")
+        self._get_page_extractor().load_ocr_model()
+
+    def image2page(
+        self,
+        image: Image,
+        page_index: int,
+        asset_hub: AssetHub,
+        ocr_size: DeepSeekOCRSize,
+        includes_footnotes: bool,
+        includes_raw_image: bool,
+        plot_path: Path | None,
+        max_tokens: int | None,
+        max_output_tokens: int | None,
+        device_number: int | None,
+        aborted: AbortedCheck,
+    ) -> Page:
+        self._validate_ocr_size(ocr_size)
+        from doc_page_extractor.extraction_context import AbortError, TokenLimitError
+        from doc_page_extractor.types import ExtractionContext
+
+        raw_image: Image | None = None
+
+        if includes_raw_image:
+            raw_image = image
+            image = image.copy()
+
+        with tempfile.TemporaryDirectory() as temp_dir_path:
+            context = ExtractionContext(
+                check_aborted=aborted,
+                max_tokens=max_tokens,
+                max_output_tokens=max_output_tokens,
+                output_dir_path=temp_dir_path,
+            )
+            step_index: int = 1
+            results = []
+            generator = self._page_results(
+                image=image,
+                page_index=page_index,
+                size=ocr_size,
+                stages=2 if includes_footnotes else 1,
+                context=context,
+                device_number=device_number,
+            )
+            while True:
+                try:
+                    image, page_result = next(generator)
+                except StopIteration:
+                    break
+                except AbortError:
+                    raise
+                except TokenLimitError:
+                    raise
+                except ErrorCallbackError:
+                    raise
+                except Exception as error:
+                    if _has_payment_required_status(error):
+                        raise OCRBillingError(page_index=page_index) from error
+                    raise OCRError(
+                        f"Failed to extract page {page_index} layout at stage {step_index}.",
+                        page_index=page_index,
+                        step_index=step_index,
+                    ) from error
+
+                results.append((image, page_result))
+                step_index += 1
+
+            return self.results2page(
+                results=results,
+                page_index=page_index,
+                asset_hub=asset_hub,
+                includes_footnotes=includes_footnotes,
+                raw_image=raw_image,
+                plot_path=plot_path,
+                input_tokens=context.input_tokens,
+                output_tokens=context.output_tokens,
+                aborted=aborted,
+            )
+
+    def _page_results(self, *, image, page_index, size, stages, context, device_number):
+        """Own pass boundaries; upstream still performs each local recognition."""
+        from doc_page_extractor.redacter import background_color, redact, clip_layouts_to_unmasked_area
+        from doc_page_extractor.structure import build_structured_page
+        from ..extractor.progress import page_stage_sync
+        from .ocr import _redact_rectangles
+
+        if isinstance(self._ocr, (UnlimitedOCRLocalConfig, UnlimitedOCRVendorConfig)):
+            stages = 1
+        extractor = self._get_page_extractor()
+        rectangles = ()
+        result = None
+        for index in range(stages):
+            if index:
+                assert result is not None
+                page_stage_sync(page_index, 2)
+                rectangles = tuple(_redact_rectangles(image.size, (layout.det for layout in result.layouts)))
+                image = redact(image=image.copy(), fill_color=background_color(image), rectangles=rectangles)
+                page_stage_sync(page_index, 3)
+            generator = extractor.extract_page_results(
+                image=image, size=size, stages=1, context=context, device_number=device_number,
+            )
+            try:
+                for rendered, result in generator:
+                    if rectangles:
+                        result.layouts = clip_layouts_to_unmasked_area(result.layouts, rectangles)
+                        result.structured = build_structured_page(result.layouts)
+                    yield rendered, result
+            finally:
+                close = getattr(generator, 'close', None)
+                if close is not None:
+                    close()
+
+    def results2page(
+        self,
+        *,
+        results,
+        page_index: int,
+        asset_hub: AssetHub,
+        includes_footnotes: bool,
+        raw_image: Image | None,
+        plot_path: Path | None,
+        input_tokens: int,
+        output_tokens: int,
+        aborted: AbortedCheck,
+    ) -> Page:
+        """Convert already fetched OCR results without re-entering the vendor."""
+        from doc_page_extractor.plot import plot
+
+        body_layouts: list[PageLayout] = []
+        footnotes_layouts: list[PageLayout] = []
+        number_image = None
+        for step_index, (image, page_result) in enumerate(results, start=1):
+            if step_index == 1:
+                number_image = image
+            for page_layout, is_footnote in self._iter_page_layouts(
+                image=image,
+                structured=page_result.structured,
+                number_image=number_image,
+                asset_hub=asset_hub,
+                stage_index=step_index,
+                includes_footnotes=includes_footnotes,
+            ):
+                if is_footnote:
+                    page_layout.order = len(footnotes_layouts)
+                    footnotes_layouts.append(page_layout)
+                elif step_index == 1:
+                    page_layout.order = len(body_layouts)
+                    body_layouts.append(page_layout)
+                elif page_layout.ref not in ASSET_TAGS:
+                    page_layout.order = len(footnotes_layouts)
+                    footnotes_layouts.append(page_layout)
+
+            check_aborted(aborted)
+            if plot_path is not None:
+                plot_file_path = (
+                    plot_path / f"page_{page_index}_stage_{step_index}.png"
+                )
+                plotted = plot(image.copy(), page_result.layouts)
+                plotted.save(plot_file_path, format="PNG")
+                plotted.close()
+                check_aborted(aborted)
+
+        if number_image is not None:
+            body_layouts, footnotes_layouts = preserve_ruled_forms(
+                number_image, body_layouts, footnotes_layouts, asset_hub)
+        return Page(
+            index=page_index,
+            image=raw_image,
+            body_layouts=body_layouts,
+            footnotes_layouts=footnotes_layouts,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
+    def _iter_page_layouts(
+        self,
+        image: Image,
+        structured,
+        asset_hub: AssetHub,
+        stage_index: int,
+        includes_footnotes: bool,
+        number_image: Image | None = None,
+    ):
+        if structured is None:
+            return
+
+        obstructions = [block.det for block in structured.blocks
+                        if _LAYOUT_KIND_TO_REF.get(str(block.kind.value)) in ASSET_TAGS]
+        for block in structured.blocks:
+            kind = str(block.kind.value)
+            ref = _LAYOUT_KIND_TO_REF.get(kind, "unknown")
+            if ref == "unknown":
+                continue
+            is_footnote = kind == "footnote"
+            # Keep first-pass evidence even when footnote output is disabled:
+            # page refinement may recover text misclassified by the OCR model.
+            # Analysis, rather than this irreversible decoding step, selects
+            # which capabilities are enabled. This does not request stage two.
+            if is_footnote and not includes_footnotes and stage_index != 1:
+                continue
+
+            text = self._normalize_block_text(block)
+            det = self._normalize_layout_det(image.size, block.det)
+            if det is None:
+                continue
+
+            # Repeated cells and markup are ordinary asset structure, not
+            # evidence of OCR hallucination. Keep the original crop as well.
+            if ref not in ASSET_TAGS:
+                # 检测短模式重复（如 "1.1.1.1."）
+                if has_repetitive_ngrams(
+                    text, min_ngram=2, max_ngram=5, repeat_threshold=16
+                ):
+                    continue
+
+                # 检测长模式重复（保守策略）
+                if has_repetitive_ngrams(
+                    text, min_ngram=6, max_ngram=20, repeat_threshold=8
+                ):
+                    continue
+
+            if stage_index != 1 and ref in ASSET_TAGS:
+                continue
+
+            asset_hash: str | None = None
+            if ref in ASSET_TAGS:
+                asset_hash = asset_hub.clip(image, det)
+
+            lines = (printed_line_metrics(image, det)
+                     if stage_index == 1 and ref == 'text' and '<' not in text else None)
+            yield PageLayout(
+                ref=ref,
+                det=det,
+                text=text,
+                hash=asset_hash,
+                order=0,
+                first_line_inset=(first_line_inset(image, det, obstructions)
+                                  if stage_index == 1 and ref == "text" and not is_footnote
+                                  and "<" not in text else None),
+                printed_line_count=lines.line_count if lines is not None else None,
+                printed_line_height=lines.median_ink_height if lines is not None else None,
+                printed_line_lefts=lines.left_offsets if lines is not None else None,
+                number_ink_bbox=(number_ink_bbox(number_image, det, text)
+                                 if ref == "text" and number_image is not None
+                                 and number_image.size == image.size else None),
+                vertical_columns=(has_vertical_columns(image, det)
+                                  if stage_index == 1 and ref == "text" and not is_footnote
+                                  and "<" not in text and "\\" not in text else False),
+            ), is_footnote
+
+    def _normalize_block_text(self, block) -> str:
+        parts: list[str] = []
+        text = block.html if block.html is not None else block.text
+        text = self._normalize_text(text)
+        if text:
+            parts.append(text)
+
+        for child in block.children:
+            child_text = child.html if child.html is not None else child.text
+            child_text = self._normalize_text(child_text)
+            if child_text:
+                parts.append(child_text)
+
+        return "\n".join(parts)
+
+    def _normalize_text(self, text: str | None) -> str:
+        if text is None:
+            return ""
+        return safe_text(normalize_whitespace(text, trim=True))
+
+    def _validate_ocr_size(self, ocr_size: DeepSeekOCRSize) -> None:
+        if isinstance(self._ocr, DeepSeekOCR2LocalConfig) and ocr_size == "tiny":
+            raise ValueError(
+                "deepseek-ocr2-local is not reliable with ocr_size='tiny'; "
+                "use ocr_size='base' for the validated local OCR2 path."
+            )
+
+    def _normalize_layout_det(
+        self,
+        size: tuple[int, int],
+        det: tuple[int, int, int, int],
+    ) -> tuple[int, int, int, int] | None:
+        width, height = size
+        left, top, right, bottom = det
+        left = max(0, min(left, width))
+        top = max(0, min(top, height))
+        right = max(0, min(right, width))
+        bottom = max(0, min(bottom, height))
+
+        if left >= right or top >= bottom:
+            return None
+        return left, top, right, bottom
+
+
+def _has_payment_required_status(error: Exception) -> bool:
+    """Recognise a provider's HTTP 402 without coupling to its client library."""
+    status_code = getattr(error, "status_code", None)
+    if status_code == 402:
+        return True
+    response = getattr(error, "response", None)
+    return getattr(response, "status_code", None) == 402

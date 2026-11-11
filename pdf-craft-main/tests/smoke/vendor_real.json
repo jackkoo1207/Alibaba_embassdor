@@ -1,0 +1,64 @@
+{
+  "defaults": {
+    "page_indexes": [
+      1,
+      2,
+      3
+    ],
+    "ocr_size": "tiny",
+    "ocr_concurrency": 3
+  },
+  "runs": [
+    {
+      "asset": "pdf/citation.pdf",
+      "route": "markdown",
+      "backend": "deepseek-ocr-vendor"
+    },
+    {
+      "asset": "pdf/table&formula.pdf",
+      "route": "markdown",
+      "backend": "deepseek-ocr-vendor",
+      "translation": {
+        "translation_llm_profile": "translation",
+        "fill_llm_profile": "fill",
+        "target_language": "zh",
+        "submit": "REPLACE",
+        "max_group_tokens": 2600,
+        "concurrency": 3,
+        "retry_policy": {
+          "fill": 12
+        }
+      }
+    },
+    {
+      "asset": "epub/Cambridge.epub",
+      "route": "epub-translate",
+      "translation": {
+        "translation_llm_profile": "translation",
+        "fill_llm_profile": "fill",
+        "target_language": "zh",
+        "submit": "REPLACE",
+        "max_group_tokens": 2600,
+        "concurrency": 3,
+        "retry_policy": {
+          "fill": 12
+        }
+      }
+    },
+    {
+      "asset": "epub/The little prince.epub",
+      "route": "epub-translate",
+      "translation": {
+        "translation_llm_profile": "translation",
+        "fill_llm_profile": "fill",
+        "target_language": "zh",
+        "submit": "REPLACE",
+        "max_group_tokens": 2600,
+        "concurrency": 3,
+        "retry_policy": {
+          "fill": 12
+        }
+      }
+    }
+  ]
+}

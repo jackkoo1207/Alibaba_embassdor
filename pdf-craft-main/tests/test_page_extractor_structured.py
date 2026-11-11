@@ -1,0 +1,211 @@
+import unittest
+from tempfile import TemporaryDirectory
+from pathlib import Path
+
+from PIL import Image
+
+from pdf_craft.common import AssetHub
+from pdf_craft.pdf.page_extractor import PageExtractorNode
+from pdf_craft.ocr_config import DeepSeekOCRLocalConfig
+
+
+class _Kind:
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+
+class _Block:
+    def __init__(
+        self,
+        kind: str,
+        det: tuple[int, int, int, int],
+        text: str | None = None,
+        html: str | None = None,
+        children: list["_Block"] | None = None,
+    ) -> None:
+        self.kind = _Kind(kind)
+        self.det = det
+        self.text = text
+        self.html = html
+        self.children = children or []
+
+
+class _Structured:
+    def __init__(self, blocks: list[_Block]) -> None:
+        self.blocks = blocks
+
+
+class TestStructuredPageMapping(unittest.TestCase):
+    def test_repeated_table_cells_survive_decoding_with_their_image(self):
+        node = PageExtractorNode(DeepSeekOCRLocalConfig())
+        image = Image.new("RGB", (100, 100), "white")
+        text = '<table><tr>' + '<td>0</td>' * 16 + '</tr></table>'
+        structured = _Structured([_Block(kind='table', det=(10, 10, 90, 90), html=text)])
+        with TemporaryDirectory() as directory:
+            layouts = list(node._iter_page_layouts(  # pylint: disable=protected-access
+                image, structured, AssetHub(Path(directory)), 1, False))
+            self.assertEqual(len(layouts), 1)
+            self.assertEqual(layouts[0][0].text, text)
+            self.assertIsNotNone(layouts[0][0].hash)
+            self.assertEqual(len(list(Path(directory).iterdir())), 1)
+        image.close()
+
+    def test_asset_block_includes_structured_caption(self):
+        node = PageExtractorNode(DeepSeekOCRLocalConfig())
+        image = Image.new("RGB", (100, 100), "white")
+        structured = _Structured(
+            blocks=[
+                _Block(
+                    kind="image",
+                    det=(10, 10, 80, 80),
+                    text="",
+                    children=[
+                        _Block(
+                            kind="image_caption",
+                            det=(10, 82, 80, 94),
+                            text="Figure 1. Caption",
+                        )
+                    ],
+                )
+            ]
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            asset_path = Path(temp_dir)
+            layouts = list(
+                node._iter_page_layouts(  # pylint: disable=protected-access
+                    image=image,
+                    structured=structured,
+                    asset_hub=AssetHub(asset_path),
+                    stage_index=1,
+                    includes_footnotes=False,
+                )
+            )
+            layouts = [layout for layout, _ in layouts]
+
+            self.assertEqual(len(layouts), 1)
+            self.assertEqual(layouts[0].ref, "image")
+            self.assertEqual(layouts[0].text, "Figure 1. Caption")
+            self.assertIsNotNone(layouts[0].hash)
+            files = list(asset_path.iterdir())
+            self.assertEqual(len(files), 1)
+            self.assertEqual(files[0].suffix, ".png")
+            self.assertEqual(files[0].stem, layouts[0].hash)
+
+    def test_stage_two_asset_does_not_create_asset_file(self):
+        node = PageExtractorNode(DeepSeekOCRLocalConfig())
+        image = Image.new("RGB", (100, 100), "white")
+        structured = _Structured(
+            blocks=[
+                _Block(
+                    kind="image",
+                    det=(10, 10, 80, 80),
+                    text="Discarded stage two image",
+                )
+            ]
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            asset_path = Path(temp_dir)
+            layouts = list(
+                node._iter_page_layouts(  # pylint: disable=protected-access
+                    image=image,
+                    structured=structured,
+                    asset_hub=AssetHub(asset_path),
+                    stage_index=2,
+                    includes_footnotes=False,
+                )
+            )
+
+            self.assertEqual(layouts, [])
+            self.assertEqual(list(asset_path.iterdir()), [])
+
+    def test_caption_kind_preserves_asset_caption_ref(self):
+        node = PageExtractorNode(DeepSeekOCRLocalConfig())
+        image = Image.new("RGB", (100, 100), "white")
+        structured = _Structured(
+            blocks=[
+                _Block(
+                    kind="table_caption",
+                    det=(10, 82, 80, 94),
+                    text="Table 1: Caption",
+                )
+            ]
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            layouts = list(
+                node._iter_page_layouts(  # pylint: disable=protected-access
+                    image=image,
+                    structured=structured,
+                    asset_hub=AssetHub(Path(temp_dir)),
+                    stage_index=1,
+                    includes_footnotes=False,
+                )
+            )
+
+        self.assertEqual(len(layouts), 1)
+        layout, is_footnote = layouts[0]
+        self.assertEqual(layout.ref, "table_caption")
+        self.assertEqual(layout.text, "Table 1: Caption")
+        self.assertFalse(is_footnote)
+
+    def test_later_footnote_kind_is_excluded_when_footnotes_are_disabled(self):
+        node = PageExtractorNode(DeepSeekOCRLocalConfig())
+        image = Image.new("RGB", (100, 100), "white")
+        structured = _Structured(
+            blocks=[
+                _Block(
+                    kind="footnote",
+                    det=(10, 82, 80, 94),
+                    text="1. Footnote",
+                )
+            ]
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            layouts = list(
+                node._iter_page_layouts(  # pylint: disable=protected-access
+                    image=image,
+                    structured=structured,
+                    asset_hub=AssetHub(Path(temp_dir)),
+                    stage_index=2,
+                    includes_footnotes=False,
+                )
+            )
+
+        self.assertEqual(layouts, [])
+
+    def test_footnote_kind_is_marked_when_enabled(self):
+        node = PageExtractorNode(DeepSeekOCRLocalConfig())
+        image = Image.new("RGB", (100, 100), "white")
+        structured = _Structured(
+            blocks=[
+                _Block(
+                    kind="footnote",
+                    det=(10, 82, 80, 94),
+                    text="1. Footnote",
+                )
+            ]
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            layouts = list(
+                node._iter_page_layouts(  # pylint: disable=protected-access
+                    image=image,
+                    structured=structured,
+                    asset_hub=AssetHub(Path(temp_dir)),
+                    stage_index=1,
+                    includes_footnotes=True,
+                )
+            )
+
+        self.assertEqual(len(layouts), 1)
+        layout, is_footnote = layouts[0]
+        self.assertEqual(layout.ref, "text")
+        self.assertEqual(layout.text, "1. Footnote")
+        self.assertTrue(is_footnote)
+
+
+if __name__ == "__main__":
+    unittest.main()

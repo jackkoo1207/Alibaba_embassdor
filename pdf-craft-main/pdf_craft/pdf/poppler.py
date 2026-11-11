@@ -1,0 +1,161 @@
+"""Read-only Poppler adapter. PDF object editing belongs to the patcher."""
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from io import BytesIO
+import logging
+from math import ceil, floor, isfinite, sqrt
+from pathlib import Path
+import re
+
+from PIL import Image
+
+from ..runtime import run_subprocess_sync
+from .types import PDFDocumentMetadata
+
+
+_LOGGER = logging.getLogger(__name__)
+MAX_PAGE_PIXELS = 80_000_000
+
+
+def _render_dpi(size: tuple[float, float], requested: int) -> int:
+    """Bound Poppler's ceil-rounded raster before allocating any pixel buffers."""
+    if requested < 1 or any(not isfinite(value) or value <= 0 for value in size):
+        raise ValueError("Invalid PDF page geometry or rendering DPI")
+    # pdfinfo -box rounds each coordinate to two decimals. Account for both
+    # endpoints, including floating-point rounding, rather than underestimating.
+    width, height = (value + 0.02 for value in size)
+
+    def fits(dpi: int) -> bool:
+        return ceil(width * dpi / 72) * ceil(height * dpi / 72) <= MAX_PAGE_PIXELS
+
+    if not fits(1):
+        raise ValueError(f"PDF page exceeds {MAX_PAGE_PIXELS} pixels even at 1 DPI")
+    if fits(requested):
+        return requested
+    candidate = max(1, min(requested, floor(72 * sqrt(MAX_PAGE_PIXELS / width / height))))
+    # Integer pixel rounding matters particularly for extremely narrow pages.
+    # Binary search keeps the correction bounded even for extreme aspect ratios.
+    lower, upper = 1, candidate
+    while lower < upper:
+        middle = (lower + upper + 1) // 2
+        if fits(middle):
+            lower = middle
+        else:
+            upper = middle - 1
+    return lower
+
+
+@dataclass(frozen=True)
+class PageGeometry:
+    """PDF-point boxes before rotation; rasterization uses the MediaBox."""
+
+    media_box: tuple[float, float, float, float]
+    crop_box: tuple[float, float, float, float]
+    rotation: int
+
+    @property
+    def size(self) -> tuple[float, float]:
+        left, bottom, right, top = self.media_box
+        width, height = right - left, top - bottom
+        return (height, width) if self.rotation % 180 else (width, height)
+
+
+class PopplerDocument:
+    """Small CLI boundary with explicit process ownership and cancellation."""
+
+    def __init__(self, source: Path, poppler_path: Path | None = None,
+                 aborted: Callable[[], bool] | None = None) -> None:
+        self.source = source.resolve()
+        self.poppler_path = poppler_path
+        self.aborted = aborted
+        self._info: dict[str, str] | None = None
+        self._geometries: dict[int, PageGeometry] = {}
+
+    def command(self, name: str) -> str:
+        return str(self.poppler_path / name) if self.poppler_path else name
+
+    def _run(self, *arguments: str) -> bytes:
+        output, stderr = run_subprocess_sync(
+            *arguments, aborted=self.aborted,
+        )
+        diagnostic = stderr.decode("utf-8", errors="replace").strip()
+        # Successful processes may report recoverable PDF/font problems on
+        # stderr. Each caller validates its output instead of rejecting it here.
+        if diagnostic:
+            _LOGGER.warning("Poppler %s: %s", Path(arguments[0]).name, diagnostic)
+        return output
+
+    @property
+    def info(self) -> dict[str, str]:
+        if self._info is None:
+            output = self._run(self.command("pdfinfo"), "-enc", "UTF-8", "-isodates", str(self.source))
+            self._info = {
+                key.strip(): value.strip() for line in output.decode("utf-8").splitlines()
+                if ":" in line for key, value in [line.split(":", 1)]
+            }
+        return self._info
+
+    @property
+    def pages_count(self) -> int:
+        count = int(self.info["Pages"])
+        if count <= 0:
+            raise ValueError("PDF has no pages")
+        return count
+
+    def geometry(self, page_index: int) -> PageGeometry:
+        if not 1 <= page_index <= self.pages_count:
+            raise IndexError(f"PDF page {page_index} is out of range")
+        if page_index not in self._geometries:
+            output = self._run(self.command("pdfinfo"), "-f", str(page_index), "-l", str(page_index),
+                               "-box", str(self.source)).decode("utf-8")
+            boxes = {}
+            for name in ("MediaBox", "CropBox"):
+                match = re.search(rf"(?:Page\s+\d+\s+)?{name}:\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)", output)
+                if match is None:
+                    raise ValueError(f"Poppler did not report {name} for page {page_index}")
+                boxes[name] = tuple(float(value) for value in match.groups())
+            rotation = re.search(r"(?:Page\s+\d+\s+)?(?:Page\s+)?rot:\s+(-?\d+)", output)
+            if rotation is None:
+                raise ValueError(f"Poppler did not report rotation for page {page_index}")
+            self._geometries[page_index] = PageGeometry(
+                boxes["MediaBox"], boxes["CropBox"], int(rotation[1]) % 360,
+            )
+        return self._geometries[page_index]
+
+    def metadata(self) -> PDFDocumentMetadata:
+        info = self.info
+        author = info.get("Author", "")
+        authors = [author.strip()] if author.strip() else []
+        for separator in (";", ",", "&"):
+            if separator in author:
+                authors = [part.strip() for part in author.split(separator) if part.strip()]
+                break
+        try:
+            modified = datetime.fromisoformat(info.get("ModDate", ""))
+            if modified.tzinfo is None:
+                modified = modified.replace(tzinfo=timezone.utc)
+        except ValueError:
+            modified = datetime.now(timezone.utc)
+        return PDFDocumentMetadata(
+            title=info.get("Title") or None, description=info.get("Subject") or None,
+            publisher=None, isbn=None, authors=authors, editors=[], translators=[], modified=modified,
+        )
+
+    def render_dpi(self, page_index: int, dpi: int) -> int:
+        """Effective DPI for the full MediaBox, including page rotation."""
+        if dpi <= 0 or not 1 <= page_index <= self.pages_count:
+            raise ValueError("Invalid PDF page or rendering DPI")
+        return _render_dpi(self.geometry(page_index).size, dpi)
+
+    def render_page(self, page_index: int, dpi: int) -> Image.Image:
+        dpi = self.render_dpi(page_index, dpi)
+        output = self._run(self.command("pdftoppm"), "-f", str(page_index), "-l", str(page_index),
+                           "-singlefile", "-r", str(dpi), str(self.source))
+        with Image.open(BytesIO(output)) as image:
+            return image.convert("RGB")
+
+    def close(self) -> None:
+        """CLI processes and image buffers are released by each operation."""

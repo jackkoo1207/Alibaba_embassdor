@@ -1,0 +1,14 @@
+services:
+  ebook:
+    build: .
+    container_name: ebook_app
+    ports:
+      - "8140:8140"
+    environment:
+      # Option A: bake the key in (never commit this file with a real key)
+      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY:-}
+      # Option B: mount a key file instead (leave env empty, then paste in the UI)
+      # - KEY_FILE=/run/secrets/qwen_key
+    volumes:
+      - ./data:/app/data      # keeps uploaded/generate books + saved key across rebuilds
+    restart: unless-stopped

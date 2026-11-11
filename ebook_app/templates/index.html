@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Audio Picture Book Studio</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">📖 AI Audio Picture Book Studio</div>
+    <div class="actions">
+      <button id="navUpload" class="sidebtn">⬆ Upload</button>
+      <button id="navStorage" class="sidebtn">🗄 Storage</button>
+    </div>
+  </header>
+
+  <main id="app">
+    <!-- HOME -->
+    <section id="view-home" class="view active">
+      <div class="hero">
+        <h1>Turn a scanned picture book into an animated audio e-book</h1>
+        <p>Upload a PDF, pick which pages to animate, and we narrate + animate each page.</p>
+        <div class="hero-btns">
+          <button id="homeUpload" class="big">Upload a book</button>
+          <button id="homeStorage" class="big ghost">My library</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- UPLOAD -->
+    <section id="view-upload" class="view">
+      <h2>Upload</h2>
+      <div class="card">
+        <label class="field">
+          <span>Qwen API key</span>
+          <input id="apiKey" type="password" placeholder="sk-..." autocomplete="off">
+          <small id="keyHint"></small>
+        </label>
+        <label class="field">
+          <span>Scanned PDF</span>
+          <input id="pdfFile" type="file" accept="application/pdf">
+        </label>
+        <button id="btnUpload" class="big">Upload &amp; preview pages</button>
+      </div>
+
+      <div id="pagePick" class="card hidden">
+        <p class="muted">Click a page to toggle animation on/off. Pages left OFF are shown as-is
+        (use for cover / author / last page).</p>
+        <div id="pageGrid" class="grid"></div>
+        <button id="btnGenerate" class="big">Generate e-book</button>
+      </div>
+
+      <div id="progress" class="card hidden">
+        <h3>Generating…</h3>
+        <div class="bar"><div id="barFill"></div></div>
+        <p id="progText" class="muted">Starting…</p>
+      </div>
+    </section>
+
+    <!-- STORAGE -->
+    <section id="view-storage" class="view">
+      <h2>Storage</h2>
+      <div id="libList" class="card"></div>
+    </section>
+
+    <!-- READER -->
+    <section id="view-reader" class="view">
+      <div class="reader-top">
+        <button id="backToLib" class="ghost">← Library</button>
+        <span id="readerTitle"></span>
+      </div>
+      <div class="stage"><div class="book" id="book"></div></div>
+      <div class="controls">
+        <button id="prev" class="ghost">← Back</button>
+        <div class="dots" id="dots"></div>
+        <div class="meta">
+          <span class="pageno" id="pageno"></span>
+          <button id="replay" class="toggle">🔊 Replay</button>
+          <button id="next">Start ➤</button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="credits">
+    Powered by <b>QwenWork</b> · <b>Wan2.7</b> · <b>Qwen TTS</b>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

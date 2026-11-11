@@ -1,0 +1,173 @@
+# pylint: disable=unused-argument
+from pdf_craft.usage import UsageCollector
+from collections.abc import Mapping
+from pdf_craft.policies import RetryPolicy, ErrorPolicyInput
+from pdf_craft._policy import OMITTED, policy_operation
+import logging
+import re
+from pathlib import Path
+
+from ...common import XMLReader, save_xml
+from ...concurrency import AsyncExecutor
+from ...llm import LLM
+from ...runtime import IO_DOMAIN
+from ...pdf import TITLE_TAGS, Page
+from ...pdf import decode as decode_pdf
+from .llm_analyser import (
+    LLMAnalysisError,
+    analyse_title_levels_by_llm,
+    analyse_toc_levels_by_llm,
+)
+from .toc_levels import Ref2Level, analyse_title_levels, analyse_toc_levels
+from .toc_pages import PageRef, find_toc_pages
+from .types import Toc, TocInfo
+from .types import encode as encode_toc
+
+logger = logging.getLogger(__name__)
+
+_TITLE_HEAD_REGX = re.compile(r"^\s*#{1,6}\s*")
+
+
+@policy_operation
+async def analyse_toc(
+    pages_path: Path,
+    toc_path: Path,
+    toc_assumed: bool,
+    toc_llm: LLM | None = None, *,
+    toc_executor: AsyncExecutor | None = None,
+    retry_policy: RetryPolicy | None = None, error_policy: ErrorPolicyInput = OMITTED,
+    request_headers: Mapping[str, str] | None = None,
+    usage: UsageCollector | None = None,
+    printed_page_indexes: list[int] | None = None,
+) -> TocInfo:
+    # Derived TOCs are outputs, not reusable evidence. Old caches lack the
+    # adopted-state/configuration identity, so recompute rather than trust them.
+    await IO_DOMAIN.run(toc_path.parent.mkdir, parents=True, exist_ok=True)
+    toc_info = await _do_analyse_toc(pages_path, toc_llm, toc_assumed, printed_page_indexes, toc_executor)
+    await IO_DOMAIN.run(save_xml, encode_toc(toc_info), toc_path)
+
+    return toc_info
+
+
+async def _do_analyse_toc(
+    pages_path: Path,
+    toc_llm: LLM | None,
+    toc_assumed: bool,
+    printed_page_indexes: list[int] | None = None,
+    toc_executor: AsyncExecutor | None = None,
+) -> TocInfo:
+    pages: XMLReader[Page] = await IO_DOMAIN.run(XMLReader,
+        prefix="page",
+        dir_path=pages_path,
+        decode=decode_pdf,
+    )
+    toc_pages = await IO_DOMAIN.run(detect_printed_pages, pages_path) if toc_assumed else []
+    if printed_page_indexes is not None:
+        toc_pages = [page for page in toc_pages if page.page_index in printed_page_indexes]
+
+    ref2level: Ref2Level | None = None
+    toc_page_indexes: list[int] = []
+
+    if toc_pages:
+        if toc_llm is not None:
+            try:
+                ref2level = await analyse_toc_levels_by_llm(
+                    llm=toc_llm,
+                    executor=toc_executor,
+                    toc_page_refs=toc_pages,
+                    toc_page_contents=await IO_DOMAIN.run(lambda: list(
+                        pages.read(
+                            page_indexes={
+                                toc_page.page_index for toc_page in toc_pages
+                            },
+                        )
+                    )),
+                )
+            except LLMAnalysisError as error:
+                from ..._policy import recover
+                from ...policies import FailureCategory
+                from ..._failure_sources import ocr_locations
+                targets = await IO_DOMAIN.run(ocr_locations, pages_path)
+                await recover(error, FailureCategory.ANALYSIS, 'toc_analysis', 'statistical_analysis', targets=targets)
+
+        if ref2level is None:
+            ref2level = await IO_DOMAIN.run(analyse_toc_levels,
+                pages=pages,
+                pages_path=pages_path,
+                toc_pages=toc_pages,
+            )
+        toc_page_indexes.extend(ref.page_index for ref in toc_pages)
+        toc_page_indexes.sort()
+
+    else:
+        if toc_llm is not None:
+            try:
+                ref2level = await analyse_title_levels_by_llm(toc_llm, pages, executor=toc_executor)
+            except LLMAnalysisError as error:
+                from ..._policy import recover
+                from ...policies import FailureCategory
+                from ..._failure_sources import ocr_locations
+                targets = await IO_DOMAIN.run(ocr_locations, pages_path)
+                await recover(error, FailureCategory.ANALYSIS, 'title_analysis', 'statistical_analysis', targets=targets)
+
+        if ref2level is None:
+            ref2level = await IO_DOMAIN.run(analyse_title_levels, pages)
+
+    # A printed directory page is excluded from chapter content. It cannot
+    # also provide a chapter anchor, even if another directory page matched it.
+    if printed_page_indexes is not None:
+        toc_page_indexes = list(printed_page_indexes)
+    excluded = set(toc_page_indexes)
+    ref2level = {key: level for key, level in ref2level.items() if key[0] not in excluded}
+    return TocInfo(
+        content=_structure_toc_by_levels(ref2level, {
+            (page.index, layout.anchor_order): (page.index, layout.order)
+            for page in pages.read() for layout in page.body_layouts
+        }),
+        page_indexes=toc_page_indexes,
+    )
+
+
+def detect_printed_pages(pages_path: Path) -> list[PageRef]:
+    """Classify printed directories without assigning chapter identities."""
+    pages = XMLReader(prefix="page", dir_path=pages_path, decode=decode_pdf)
+    return find_toc_pages(
+        iter_titles=lambda: ((page.index, [(layout.anchor_order, _TITLE_HEAD_REGX.sub("", layout.text))
+                                          for layout in page.body_layouts if layout.ref in TITLE_TAGS])
+                             for page in pages.read()),
+        iter_page_bodies=lambda: ((page.index, "".join(layout.text for layout in page.body_layouts))
+                                 for page in pages.read()),
+    )
+
+
+def _structure_toc_by_levels(ref2level: Ref2Level, positions=None) -> list[Toc]:
+    # virtual root
+    root = Toc(
+        id=-1,
+        page_index=-1,
+        order=-1,
+        level=-1,
+        children=[],
+    )
+    next_id: int = 1
+    stack: list[Toc] = [root]
+
+    for (page_index, order), level in sorted(ref2level.items(), key=lambda x: positions[x[0]] if positions is not None else x[0]):
+        toc = Toc(
+            id=next_id,
+            page_index=page_index,
+            order=order,
+            level=level,
+            children=[],
+        )
+        next_id += 1
+        while stack and stack[-1].level >= level:
+            stack.pop()
+
+        if not stack:
+            break
+
+        stack[-1].children.append(toc)
+        stack.append(toc)
+
+    return root.children

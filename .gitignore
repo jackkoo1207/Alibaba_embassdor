@@ -1,0 +1,34 @@
+# ---- Generated book data (large media: mp4/mp3/png per page) ----
+# These are produced at runtime by the pipeline and must NOT be committed.
+ebook_app/data/
+data/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---- Runtime logs / scratch ----
+*.log
+*.err
+*.out
+_lastbook.json
+_w3_*
+wan27_test/
+wan3_test/
+test/
+
+# ---- Local secrets (put your DashScope key in .env, never commit it) ----
+.env
+*.key
+
+# ---- Office temp/lock files ----
+~$*
+
+# ---- OS junk ----
+.DS_Store
+Thumbs.db
+desktop.ini

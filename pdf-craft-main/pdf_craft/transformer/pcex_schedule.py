@@ -1,0 +1,350 @@
+"""PCEX ready work shares one bounded window; delivery is a separate disk read."""
+# pylint: disable=protected-access
+import asyncio
+from contextlib import asynccontextmanager
+from dataclasses import replace
+from typing import Any
+
+from ..concurrency import fatal_error_boundary, settle_tasks
+from ..extractor.chapter.chapter import Chapter, Reference, TextFlowItem, narrative_texts, search_references_in_chapter
+from ..runtime import IO_DOMAIN, temporary_directory
+from .._failure_sources import page_sources
+from .._policy import Completion
+from .anchored_translation import _asset_slots, _translate_slots_async
+from .translation_coverage import NarrativeCoverage, AnchoredContentCoverage, paragraph_identity, accepted_translation
+from .ready_queue import ReadyQueue
+from .request_batch import MAX_BATCH_UNITS
+from .furniture_plan import FurniturePlan
+
+
+class PCEXSchedule:
+    """Only the running window is in memory. Pending and completed work is on disk."""
+
+    def __init__(self, items, transformer, window, queue, *, pages=None, aborted=lambda: False,
+                 with_anchored=False, furniture=None, metadata=None, notifier=None):
+        if window < 1:
+            raise ValueError('window must be at least 1')
+        self.items, self.transformer, self.window, self.queue = items, transformer, window, queue
+        self.pages, self.aborted = pages or {}, aborted
+        self.with_anchored, self.furniture, self.metadata = with_anchored, furniture, metadata
+        self.changed = asyncio.Event()
+        self.work_changed = asyncio.Event()
+        self.furniture_changed = asyncio.Event()
+        self.narrative_changed = asyncio.Event()
+        self.scanned = False
+        self.count = 0
+        self.consumed = False
+        self.overlay = None
+        self.headers_ready = asyncio.Event()
+        self.notifier = notifier
+        self.notifications = {channel: asyncio.Event() for channel in ("body", "footnote")}
+        self.completion = Completion()
+        self.runner: asyncio.Task | None = None
+        from .narrative_xml import NarrativeXMLTransformer
+        self.shared_narrative = isinstance(transformer, NarrativeXMLTransformer) and transformer.supports_stream
+
+    def wake(self):
+        self.changed.set()
+        self.work_changed.set()
+        self.furniture_changed.set()
+        self.narrative_changed.set()
+        for changed in self.notifications.values():
+            changed.set()
+
+    async def scan(self):
+        from .content import _unit
+        try:
+            async for item in self.items:
+                index = self.count
+                channel = 'footnote' if isinstance(item.value, Reference) else 'body'
+                def save(index=index, item=item, channel=channel):
+                    self.queue.item(index, item, channel)
+                    if item.value is not None:
+                        self.queue.add(channel, item, item=index)
+                        if self.with_anchored:
+                            for number, slot in enumerate(_asset_slots(_unit(item))):
+                                slot.payload = replace(slot.payload, flow_index=item.index, context=item.asset_context)
+                                self.queue.add('asset', (number, slot), item=index)
+                    self.queue.run('UPDATE items SET sealed=1 WHERE id=?', (index,))
+                await IO_DOMAIN.run(save)
+                self.count += 1
+                self.wake()
+        finally:
+            await self.items.aclose()
+        # EOF means successful production AND source cleanup. Failure/cancel
+        # wakes the owner through the scanner task, never through a false EOF.
+        self.scanned = True
+        self.wake()
+
+    async def execute(self, job):
+        from .content import _unit
+        from ..metering import check_aborted
+        identifier, kind, payload, _index = job
+        check_aborted(self.aborted)
+        with page_sources(self.pages):
+            if kind == 'metadata':
+                assert self.metadata is not None
+                result = await self.metadata()
+                self.overlay = result
+            elif kind == 'furniture':
+                assert self.furniture is not None
+                result = await self.furniture.execute(payload, self.transformer._furniture_transformer())
+            elif kind == 'asset':
+                number, slot = payload
+                result = number, (await _translate_slots_async([slot], self.transformer._anchored_transformer()))[0], slot.payload.identity
+            else:
+                source = _unit(payload)
+                target = await self.transformer.transform(source)
+                result = await self.narrative_result(source, target, payload)
+        await IO_DOMAIN.run(self.queue.finish, identifier, result)
+        self.wake()
+
+    async def narrative_result(self, source, target, payload):
+        """Keep acceptance, title reuse and accounting independent of grouping."""
+        states = []
+        from .package import _has_visible_content
+        for original, translated in zip(narrative_texts(source), narrative_texts(target), strict=True):
+            identity = paragraph_identity(source, original)
+            if identity is not None:
+                states.append(NarrativeCoverage(*identity, 'translated' if
+                    _has_visible_content(translated) and accepted_translation(translated) else 'preserved'))
+        if self.furniture is not None:
+            await IO_DOMAIN.run(self.furniture.titles, target)
+        primary = isinstance(payload.value, Reference) or (isinstance(payload.value, TextFlowItem) and payload.value.role != 'heading')
+        if primary:
+            self.completion.succeeded += sum(state.state == 'translated' for state in states)
+            self.completion.degraded += sum(state.state == 'preserved' for state in states)
+        return target, states
+
+    async def narratives(self):
+        from .content import _unit
+        from ..metering import check_aborted
+
+        async def chapters():
+            kinds = ['body', 'footnote']
+            while True:
+                self.narrative_changed.clear()
+                finished = self.scanned
+                job = await IO_DOMAIN.run(self.queue.take, kinds)
+                if job is not None:
+                    check_aborted(self.aborted)
+                    identifier, kind, payload, _index = job
+                    kinds.remove(kind)
+                    kinds.append(kind)
+                    yield _unit(payload), identifier
+                elif finished:
+                    return
+                else:
+                    await self.narrative_changed.wait()
+
+        async def result(target, identifier):
+            # Source identity lives in the disk queue, not a book-sized map.
+            rows = await IO_DOMAIN.run(self.queue.run, 'SELECT payload FROM jobs WHERE id=?', (identifier,))
+            import pickle
+            payload = pickle.loads(rows[0][0])
+            value = await self.narrative_result(_unit(payload), target, payload)
+            await IO_DOMAIN.run(self.queue.finish, identifier, value)
+            self.wake()
+
+        with page_sources(self.pages):
+            await self.transformer._transform_stream(chapters(), result)
+
+    @fatal_error_boundary
+    async def run(self):
+        scanner = asyncio.create_task(self.scan())
+        narrative = asyncio.create_task(self.narratives()) if self.shared_narrative else None
+        streams = [scanner] + ([narrative] if narrative is not None else [])
+        deliveries = ([asyncio.create_task(self.deliver(channel)) for channel in self.notifications]
+                      if self.notifier is not None else [])
+        observers = ([delivery._task for delivery in (self.notifier.body, self.notifier.notes) if delivery is not None]
+                     if self.notifier is not None else [])
+        for task in [*streams, *deliveries, *observers]:
+            task.add_done_callback(lambda _task: self.wake())
+        running = set()
+        kinds = ['metadata', 'asset', 'furniture'] if self.shared_narrative else ['metadata', 'body', 'footnote', 'asset', 'furniture']
+        try:
+            if self.metadata is not None:
+                await IO_DOMAIN.run(self.queue.add, 'metadata', None)
+            while True:
+                self.work_changed.clear()
+                input_finished = scanner.done()
+                if input_finished:
+                    scanner.result()
+                for task in streams[1:] + deliveries + observers:
+                    if task.done():
+                        task.result()
+                for task in tuple(running):
+                    if task.done():
+                        running.remove(task)
+                        task.result()
+                jobs = []
+                capacity = MAX_BATCH_UNITS if self.shared_narrative else self.window
+                while len(running) + len(jobs) < capacity:
+                    job = await IO_DOMAIN.run(self.queue.take, kinds)
+                    if job is None:
+                        break
+                    kind = job[1]
+                    kinds.remove(kind)
+                    kinds.append(kind)
+                    jobs.append(job)
+                for job in jobs:
+                    task = asyncio.create_task(fatal_error_boundary(self.execute)(job))
+                    task.add_done_callback(lambda _task: self.wake())
+                    running.add(task)
+                if not self.headers_ready.is_set() and not await IO_DOMAIN.run(self.queue.pending, ('metadata', 'furniture')):
+                    if self.furniture is not None:
+                        await IO_DOMAIN.run(self.furniture.finish)
+                    self.headers_ready.set()
+                # A take() that observed an empty queue before producer EOF
+                # cannot prove quiescence after EOF. Re-admit from a fresh read
+                # after observing successful scanner completion.
+                if not input_finished and scanner.done():
+                    continue
+                if input_finished and not running and (narrative is None or narrative.done()):
+                    if not await IO_DOMAIN.run(self.queue.pending):
+                        self.completion.check('translation')
+                        if all(task.done() for task in deliveries):
+                            return
+                    # Only unresolved reuse can remain when there is no ready
+                    # work and all inputs have been admitted. Missing/fallback
+                    # titles wake dependants too, with no trusted translation.
+                    if await IO_DOMAIN.run(self.queue.pending):
+                        await IO_DOMAIN.run(self.queue.run, 'UPDATE titles SET resolved=1 WHERE resolved=0')
+                        self.wake()
+                await self.work_changed.wait()
+        finally:
+            for task in [*streams, *running, *deliveries]:
+                task.cancel()
+            try:
+                await settle_tasks([*streams, *running, *deliveries])
+            finally:
+                self.wake()
+
+    async def header(self):
+        assert self.runner is not None
+        waiter = asyncio.create_task(self.headers_ready.wait())
+        try:
+            await asyncio.wait([waiter, self.runner], return_when=asyncio.FIRST_COMPLETED)
+            if self.runner.done():
+                self.runner.result()
+            return self.overlay or {}
+        finally:
+            waiter.cancel()
+            await settle_tasks([waiter])
+
+    @staticmethod
+    def combine(source: Any, results):
+        target, states, assets = None, [], []
+        for kind, result in results:
+            if kind in ('body', 'footnote'):
+                target, states = result
+        if target is None:
+            return source, (), ()
+        slots = list(_asset_slots(target))
+        for kind, result in results:
+            if kind != 'asset':
+                continue
+            number, translation, identity = result
+            slot = slots[number]
+            if translation is not None:
+                slot.asset.title, slot.asset.content, slot.asset.caption = translation.title, translation.content, translation.caption
+            assets.append(AnchoredContentCoverage(identity[0], identity[1], identity[2],
+                                                  'translated' if translation is not None else 'preserved'))
+        value = target.definitions[0] if isinstance(source.value, Reference) else target.flow_items[0]
+        if isinstance(value, Reference):
+            value.mark = source.value.mark
+        elif isinstance(source.value, TextFlowItem):
+            marks = {reference.id: reference.mark for reference in search_references_in_chapter(
+                Chapter(source.chapter_id, source.level, [source.value]))}
+            for reference in search_references_in_chapter(target):
+                if reference.id in marks:
+                    reference.mark = marks[reference.id]
+        return replace(source, value=value, original=source.value,
+                       narrative_states={(state.chapter_id, state.page_index, state.order): state.state for state in states},
+                       asset_children=frozenset(state.child_index for state in assets if state.state == 'translated')), states, assets
+
+    async def deliver(self, channel):
+        """Each callback channel advances independently of ordered file output."""
+        assert self.notifier is not None
+        changed = self.notifications[channel]
+        while True:
+            changed.clear()
+            # Observe successful EOF BEFORE the read used to prove emptiness.
+            # If EOF arrives during the read, wake() keeps the next read live.
+            input_finished = self.scanned
+            rows = await IO_DOMAIN.run(self.queue.run,
+                'SELECT id FROM items WHERE channel=? AND notified=0 ORDER BY id LIMIT 1', (channel,))
+            if rows:
+                index = rows[0][0]
+                result = await IO_DOMAIN.run(self.queue.result, index)
+                if result is not None:
+                    item, _, _ = await IO_DOMAIN.run(self.combine, *result)
+                    await self.notifier.append(item)
+                    await IO_DOMAIN.run(self.queue.discard, index, notified=True, observing=True)
+                    self.wake()
+                    continue
+            elif input_finished:
+                return
+            await changed.wait()
+
+    async def results(self, coverage, assets, on_completed=None, *, ordered=True):
+        assert self.runner is not None
+        index = 0
+        while True:
+            self.changed.clear()
+            if self.runner.done():
+                self.runner.result()
+            selected = index
+            if not ordered:
+                rows = await IO_DOMAIN.run(self.queue.run,
+                    'SELECT id FROM items WHERE sealed=1 AND consumed=0 AND NOT EXISTS '
+                    '(SELECT 1 FROM jobs WHERE item=items.id AND state!="done") ORDER BY id LIMIT 1')
+                selected = rows[0][0] if rows else -1
+            result = await IO_DOMAIN.run(self.queue.result, selected)
+            if result is not None:
+                item, states, asset_states = await IO_DOMAIN.run(self.combine, *result)
+                coverage.extend(states)
+                assets.extend(asset_states)
+                if on_completed is not None:
+                    await on_completed(item)
+                yield item
+                await IO_DOMAIN.run(self.queue.discard, selected, observing=self.notifier is not None)
+                index += 1
+            elif self.runner.done() and index == self.count:
+                self.consumed = True
+                return
+            else:
+                await self.changed.wait()
+
+
+@asynccontextmanager
+async def pcex_schedule(items, transformer, window, *, paths=None, root=None, with_furniture=False, **kwargs):
+    """Own all producers until consumers and callbacks have settled."""
+    async with temporary_directory('pdf-craft-pcex-ready-') as directory:
+        request_capacity = window
+        queue = await IO_DOMAIN.run(ReadyQueue, directory / 'work.sqlite')
+        furniture = await IO_DOMAIN.run(FurniturePlan, paths, root or directory, queue) if with_furniture else None
+        schedule = PCEXSchedule(items, transformer, window, queue, furniture=furniture, **kwargs)
+        from .progress import active_progress
+        progress = active_progress()
+        if progress is not None:
+            progress.pending_streams += 1
+        from .request_batch import request_window
+        with request_window(request_capacity):
+            runner = asyncio.create_task(schedule.run())
+        schedule.runner = runner
+        try:
+            yield schedule
+            # A normal context exit may still mean the consumer stopped early.
+            # Do not finish an unread book (or wait for blocked model requests).
+            if not schedule.consumed:
+                runner.cancel()
+            else:
+                await runner
+        finally:
+            runner.cancel()
+            try:
+                await settle_tasks([runner])
+            finally:
+                if progress is not None and schedule.consumed:
+                    progress.pending_streams -= 1

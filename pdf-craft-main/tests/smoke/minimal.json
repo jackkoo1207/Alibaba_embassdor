@@ -1,0 +1,32 @@
+{
+  "defaults": {
+    "page_indexes": [
+      1
+    ],
+    "ocr_size": "tiny",
+    "translation": {
+      "package_marker": "[smoke-translated]",
+      "package_submit": "REPLACE"
+    }
+  },
+  "runs": [
+    {
+      "asset": "pdf/double_column.pdf",
+      "route": "markdown",
+      "backend": "deepseek-ocr-local",
+      "ocr": {}
+    },
+    {
+      "asset": "pdf/double_column.pdf",
+      "route": "epub",
+      "backend": "deepseek-ocr-local",
+      "ocr": {},
+      "translation": {
+        "package_marker": "[smoke-translated]",
+        "render_mode": "BILINGUAL",
+        "translation_id": "smoke-en",
+        "target_language": "en"
+      }
+    }
+  ]
+}

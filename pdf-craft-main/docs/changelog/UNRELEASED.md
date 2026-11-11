@@ -1,0 +1,60 @@
+# Unreleased
+
+- Keep independent horizontal OCR fields out of the same author paragraph,
+  while preserving supported column wraps and adjacent runs on one text line.
+  Preserve clearly ruled forms fragmented into OCR text as artwork, without
+  replacing already structured tables. Add a frozen OCR2 form regression and
+  a cross-field PDF patch smoke check.
+- Separate fixed page-repair admission from JEV question evaluation in local
+  tools. Historical whole-page probabilities select pages using their recorded
+  threshold; repair smoke checks final target facts rather than change counts.
+
+- Improve local page-structure review in both footnote modes. Keep review decisions
+  internal, preserve complete source evidence and use readable English Jinja prompts.
+- Preserve paragraph boundaries, printed note markers and cross-page note identities
+  during incremental extraction. Keep asset titles and captions independently editable;
+  ignored or reassigned text cannot reappear through asset association.
+- Skip OCR for strictly white inputs without inventing requests or usage, and prevent
+  hidden native text from becoming visible furniture.
+- Add `RefinementStatus` to PAGE completion events so callers can distinguish disabled,
+  unnecessary, applied and fallback refinement at that page-processing boundary.
+
+- Keep deliberately excluded OCR regions occupied during native furniture
+  extraction, so page-refinement exclusions cannot be translated and filled
+  back through the furniture path. Add both citation refinement modes to the
+  paid regression with an adopted-exclusion check and manual visual review.
+
+- Preserve first-pass footnote candidates for body-only page refinement, allowing
+  wrongly classified body text to be restored and clearly identified footnotes
+  in the body to be excluded without an extra OCR pass or citation output.
+  Keep raw evidence and source identities, including cache and fallback paths.
+
+- Replace nested `FootnoteOptions` / `FootnoteRefinement` with independent
+  `ExtractionOptions.footnotes: bool` and `refinement: Refinement | None`.
+  Refinement still requires both JEV and LLM with explicit executors. Body-only
+  page refinement reuses the streaming pipeline without extra footnote OCR,
+  citations, references or footnote callbacks, including on cached OCR inputs.
+
+- Prevent intersecting neighbouring OCR boxes from being treated as empty
+  expansion space during PDF fitting and page-local font normalization.
+  Extend the three-page paid regression with an independent written-text
+  overlap check; manual source/output inspection remains required.
+- Render inline TeX atoms as vector glyph contours with their requested
+  optical size and existing ActualText semantics, avoiding full Type1 font
+  programs for a few formula glyphs at each fitted size.
+
+- Add process-local `call_id` to request observations so callers can correlate
+  retries without conflating independent provider calls or OCR polling operations.
+
+- Add constructor-level `on_request` observations for LLM, JEV and OCR vendors.
+  Every transport attempt, including retries and failures, reports timing,
+  outcome, available HTTP status and received token usage independently of
+  `UsageCollector`. Unlimited OCR control requests are distinguished from model
+  submissions. See [request observations](../en/REQUEST_OBSERVATIONS.md).
+- Honor ExtGState font objects/sizes during PDF character removal and keep
+  Hidden/NoView visual Stamps invisible. Preserve source fonts/graphics and
+  resource compression instead of returning to whole-page outlining.
+- Clarify the PDF backend boundary: pure reads/rendering use Poppler; editing
+  and its necessary font/content-stream reads may use editing helper components.
+- Include cause/context traceback locations in recoverable failure diagnostics,
+  with cycle protection and without source lines or local variables.

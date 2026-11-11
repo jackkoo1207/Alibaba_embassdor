@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+data/
+server.out
+server.err
+test_book.pdf
+Dockerfile
+docker-compose.yml
+.dockerignore
+README.md

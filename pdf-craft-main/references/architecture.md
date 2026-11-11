@@ -1,0 +1,133 @@
+# 架构与模块边界
+
+**约束范围：** 包结构、公共 API 和模块归属。**不约束：** OCR 算法细节、开发命令或发布步骤。**何时阅读：** 判断代码应放在哪里，或修改公共导入面时。
+
+## 包公共面
+
+## 新模块边界
+
+`pdf_craft` 的主要业务模块围绕可组合的文档处理阶段组织：
+
+- `extractor/`：PDF 页面、OCR、目录和章节分析的适配入口；产出 PDFCraftExtraction。
+- `document/`：PDFCraftExtraction 的 workspace/`.pcex` 存储、校验和来源位置契约。
+- `renderer/`：PDFCraftExtraction 到 Markdown 或 EPUB 的格式渲染入口。
+- `transformer/`：格式无关的 XML 内容变换，包括 LLM 翻译、结构填充和校验。
+- `pipeline/`：格式专属编排。EPUB Pipeline 将 EPUB XHTML/目录/元数据交给 Transformer；PDF Pipeline 以 replace-only 方式将 Chapter 来源区域写回 PDF。
+
+公开中间格式为 `PDFCraftExtraction`，持久化与交换载体必须是 `.pcex` ZIP。其内容为
+`manifest.json`、`pages.xml`、`chapters/`、`assets/`，以及可选 `toc.xml`、`cover.png`、
+`furnitures.xml` 和 v4 `translations/`。`translations/index.json` 按文件内唯一 ID 排列零到多个
+译文层；每层包含完整章节译文、metadata overlay、`coverage.xml`，以及可选 furniture 译文。
+目标语言只是层的元数据，同一种语言可以有多个 ID。根级 `translation.xml` 仍是旧式或内部物化
+译文视图的覆盖记录，不代表 v4 中可供渲染选择的持久化译文层。
+
+PCEX 当前格式为 v6，v4→v5 明确图片说明使用 caption。字段契约改变必须升级格式版本，
+并通过 [PCEX Migration 边界](pcex-migrations.md) 集中转换旧版本；业务只消费当前格式。
+旧归档在物化副本上迁移，不修改原文件；源章节和已有译文层同步转换。
+
+PCEX chapter 的阅读流使用 `FlowItem`：`TextFlowItem` 是作者意义的正文/标题段，包含保留
+来源 bbox 的 `SourceTextFragment`，并可在 fragment 之间嵌入图片/表格 `SourceAsset`。
+`DisplayFormula` 与 `StandaloneAsset` 是独立 flow node；段落公式不是 AnchoredContent，必须
+阻断段落拼接。类名与 chapter XML 元素一一对应，详见 `docs/*/PCEX_FORMAT.md`。
+Narrative 翻译仅把嵌在 `TextFlowItem` 中的图片/表格替换为无文本的临时 anchor，不能读取或覆写
+asset 文本；`StandaloneAsset` 不伪造 paragraph anchor，并与 NarrativeFlow 隔离；
+`AnchoredContentTransformer` 是另一条按 asset 小批次工作的翻译边界，负责 title/content/caption。
+目录-backed 形态只供一键转换在 `analysing_path/extraction/` 内部衔接前后端；普通目录不是
+公开输入。`ocr/`、`plots/`、`done` 和其他 analysis 文件仅是可丢弃的诊断/恢复缓存。
+
+`pdf_craft/__init__.py` 是公共导入面。`AsyncPDFCraft` 是业务核心，`PDFCraft` 是位于
+`pdf_craft/sync/` 的同步门面；`pdf_craft/transform.py` 是 PDF 前端
+提取 engine。Markdown、EPUB、翻译和 PDF 写回后端只能读取 PDFCraftExtraction，不得读取
+analysis/OCR 缓存。
+
+`PDFCraftExtraction` 是公开但不包含业务方法的 opaque handle。用户只能通过两个 Craft 门面的
+`open_extraction` / `export_extraction` 打开和导出，再把句柄传回门面或高级组件。高级可组合组件
+（Extractor、Renderer、Transformer、LLM runtime）仅提供无 `_async` 后缀的异步方法；同步适配
+不得进入业务核心。配置、选项、事件和数据类不拆分同步/异步版本。模型下载同样以 async 实现为准，
+同步使用通过 `PDFCraft.predownload_models()` 委派。
+
+业务执行以 async 为唯一真源：请求、重试、repair loop、编排和转换不能再提供第二套同步实现。
+`run_sync` 只能由 `pdf_craft/sync/` 的用户门面调用；禁止在实现层启动事件循环把同步业务伪装成
+异步业务。用户提供的 LLM、Transformer、TOC 转换、PDF handler 和图片 URL resolver 执行方法
+必须是异步契约，不提供同步扩展适配。普通事件通知可以接受同步或异步 callback。
+仅当第三方库没有异步接口时，才在独立执行域中调用同步适配器；适配器只承担第三方调用、
+文件读写和必要资源清理，不复制业务编排。跨域 callback 桥接不得成为另一条请求或转换路径。
+
+`translate_extraction()` 保留 source layer 并追加 replacement-only 译文层。Markdown/EPUB 渲染
+通过 `RenderMode.SOURCE`、`REPLACE`、`BILINGUAL` 决定只读原文、选择一份译文或合并原译文；
+`BILINGUAL_TEXT` 在同一来源 fragment 内追加译文。这些译文模式可显式传 translation ID，省略时稳定选择 index 第一项。PDF 写回也可显式选择译文层，
+但仅消费已有正文和 furniture 写回能力，不写回 anchored 图片/表格文字。
+
+除非任务明确要求破坏性 API 变更，否则把以下名称和默认值视为公共 API：
+
+- `PDFCraft`、`AsyncPDFCraft`、`PDFOptions`、`ExtractionOptions`、`PDFCraftExtraction`
+- `PDFExtractor`、`MarkdownRenderer`、`EpubRenderer`
+- `ExtractionTransformer`、`NarrativeXMLTransformer`
+- `AnchoredContentExtractionTransformer`、`AnchoredContentTransformer`、`AnchoredContentXMLTransformer`
+- `predownload_models`
+- `LLM`
+- `JEV`、`Refinement`
+- `DeepSeekOCRLocalConfig`、`DeepSeekOCR2LocalConfig`、`UnlimitedOCRLocalConfig`
+- `DeepSeekOCRVendorConfig`、`DeepSeekOCR2VendorConfig`、`UnlimitedOCRVendorConfig`
+- `AsyncPDFHandler`、`AsyncPDFDocument`
+- `BookMeta`、`TableRender`、`LaTeXRender`
+
+## 模块归属
+
+- `pdf_craft/pdf/` 负责 PDF 元数据、渲染、页引用、通过 `doc-page-extractor` 接入 OCR 后端，以及 OCR 页 XML 数据。
+- `pdf_craft/extractor/toc/` 负责目录页检测和标题层级分析，包括可选的 LLM 辅助分析。
+- `pdf_craft/extractor/chapter/` 负责根据 OCR 页 XML 和 TOC 事实生成章节结构。
+- `pdf_craft/markdown/` 负责 Markdown 段落解析和 Markdown 输出渲染。
+- `pdf_craft/renderer/epub/` 负责把章节数据转换为 `epub-generator` 的记录并生成 EPUB。
+- `pdf_craft/llm/` 负责增强目录分析所需的可选 LLM 调用。核心转换应保持不依赖该增强能力也可使用。
+- `pdf_craft/common/` 负责可复用的文件系统、XML、资源和统计辅助逻辑。
+
+## 翻译请求分组边界
+
+PCEX 与原生 EPUB 把连续内容送入同一个 XML mapper；章节只决定归属和写回，
+不重置预算分组。PCEX 的磁盘就绪队列提供带稳定身份的正文／脚注流，
+Narrative 适配器统一投影；EPUB 的异步 XML 根同样共用既有 splitter。
+翻译输出不设门禁，所有结构验收和修复属于 fill 层；必须遵守
+[翻译与 fill 的职责硬边界](translation-fill-boundary.md)。自由翻译 group 取得一份完整回答后，直接进入同组 XML fill Loop。
+来源归属、公式身份和 XML 落位在该回答中完成；禁止独立 JSON 分配阶段及额外模型调用。
+程序按整组译文归一化后的全文校验和来源身份采用结果，再回填原章节、自然段与 EPUB 节点。
+
+mapper 连续收集跨章节来源，以 token 预算和最多 64 个文本块组成一个有界 group。
+每组直接发起一次自由翻译，随后进入同组的 XML fill；不再拆成逐 owner 请求后
+通过 JSON 外壳重新聚合。`request_batch.py` 只维护操作级请求并发容量，
+共享 executor 继续限制供应商并发。源码暂停时有界交付尾组，不预载全书。
+
+fill 按整组全文、模板结构和必要来源结构进行原子验收；重试不会采用任何部分结果，
+不同 group 可并发前进。验证成功后按稳定身份回填各来源章节、节点与 CFI，
+正文与脚注的通知通道仍独立。无歧义的程序填充也必须通过同样的验收。
+XML 回答输出预算由模板与整组译文规模确定，所有重试共用一个有限预算。
+
+离线请求计数、跨章节、取消及回填回归见 `tests/test_translation_grouping.py`；
+最终公式内容与文档完整性回归见 `tests/test_fill_boundary.py`。
+
+## 外部包边界
+
+`doc-page-extractor` 和 `epub-generator` 是被 pin 住的运行时依赖。它们内部的问题通常应在各自仓库修复，再通过版本升级或明确的本地联调引入。本仓库 `scripts/` 下的同步脚本会覆盖 `.venv` 中已安装的依赖源码；这些脚本只是手动本地联调辅助，不是普通项目 setup。
+
+pdf-craft 对外只暴露自己的 OCR 配置对象，不暴露 `doc-page-extractor` 的 `PageExtractor`、`OCRAdapter` 或 factory 注入口。需要新增 OCR 后端时，优先在 `doc-page-extractor` 增加官方构造入口，再在 pdf-craft 映射成封闭配置对象。
+
+本包通过 `doc-page-extractor[local]` 获得上游本地 OCR 运行时栈，但不要把 `torch` 或 `torchvision` 作为 pdf-craft 的直接运行时依赖；用户仍可能需要按自己的环境覆盖安装 CPU 或 CUDA wheel。
+
+## PDF 后端边界
+
+纯读取的页数、几何、元信息、文字提取和渲染统一由 Poppler 负责，不因纯读取需求引入
+pypdf。出版标签通过 GLib 公开 API 读取；既有 catalog 标签树存在性判断是窄范围例外，
+只读 catalog、不扫描页面，不可用时仍返回空标签。
+
+PDF 编辑/写回及其必要辅助步骤可以使用 pypdf 和确有必要的编辑辅助组件，包括字体、
+字符编码、内容流读取及独立编辑断言。当前 pdfminer 仅用于回填字符删除的字体/CMap/
+文字状态解释，pypdf 执行内容流改写；不能把它扩散到前面的页数、OCR、提取或渲染路径。
+这是按具体操作职责划分，不是禁止编辑器读取被编辑对象。选择这一边界是为了既保留原有
+字体与图形、控制文件体积，又不迫使库新增 Poppler 原生编辑适配器。解释器能力缺口仍须
+用回归修复，不能通过更换职责说明掩盖错误；不增加自动编辑断言或前置门禁。
+`pdf/backend.py` 只传递嵌套操作的 Poppler 工具目录，不验证输入。转换流程没有自动完整性
+门禁；`assertions.py` 提供四个用户主动调用、成功 None/失败原异常的阻塞断言。
+EPUB 输入解析在 `pipeline/epub/adapter/`，断言与翻译共享章节读取器；epub-generator
+仅负责输出生成。
+
+本轮 v6 将来源槽与逻辑片段身份分开；历史源及全部译文层在 migration 中同步增加身份，coverage 的历史整框键保持有效。不在业务消费方补旧字段。来源范围/原文证据未知时不伪造。

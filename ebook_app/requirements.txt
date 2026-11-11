@@ -1,0 +1,7 @@
+flask
+PyMuPDF
+Pillow
+opencv-python-headless
+numpy
+dashscope
+requests
